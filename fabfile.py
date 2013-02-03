@@ -168,6 +168,7 @@ def configure_for_apache():
     with cd("/opt/graphite/conf"):
         run("sudo cp carbon.conf.example carbon.conf")
         run("sudo cp storage-schemas.conf.example storage-schemas.conf")
+        run("sudo cp graphite.wsgi.example graphite.wsgi")
 
     with settings(warn_only = True):
         sudo("rm /etc/apache2/sites-enabled/000-default")
