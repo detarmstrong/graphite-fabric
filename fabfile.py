@@ -18,33 +18,106 @@ Also tested successfully on Ubuntu 12.04 VPS.
 
 """
 
-from fabric.api import cd, sudo, run, put, settings
+from fabric.api import cd, sudo, run, put, settings, task, prompt
 
-def _check_sudo():
+
+def check_sudo():
     with settings(warn_only=True):
         result = sudo('pwd')
         if result.failed:
             print "Trying to install sudo. Must be root"
             run('apt-get update && apt-get install -y sudo')  
 
+@task
 def graphite_install():
     """
     Installs Graphite and dependencies
     """
-    _check_sudo()
-    sudo('apt-get update && apt-get upgrade -y')
-    sudo('apt-get install -y python-dev python-setuptools libxml2-dev libpng12-dev pkg-config build-essential supervisor make python g++ git-core')
-    sudo('easy_install pip')
-    sudo('pip install simplejson') # required for django admin
-    sudo('pip install carbon')
+    check_sudo()
+
+    web_server_pref = prompt("Run graphite-web under nginx or apache?",
+                             default="nginx")
+
+    install_deps(web_server_pref)
+
+    # TODO can't install cairo as ubuntu package?
+    # install_cairo()
+
+    install_giraffe_dash()
+
+
+
+    # setting the carbon config files (default)
+    with cd('/opt/graphite/conf/'):
+        sudo('cp carbon.conf.example carbon.conf')
+        sudo('cp storage-schemas.conf.example storage-schemas.conf')
+
+
+    # initializing graphite django db
+    with cd('/opt/graphite/webapp/graphite'):
+        sudo("python manage.py syncdb")
+
+    # changing ownership on graphite folders
+    sudo('chown -R www-data: /opt/graphite/')
+
+    # clearing old carbon log files
+    put('config/carbon-logrotate', '/etc/cron.daily/', use_sudo=True)
+
+    # put startup script
+    put('config/carbon', '/etc/init.d/', use_sudo=True)
+    sudo('chmod ugo+x /etc/init.d/carbon')
+    sudo('cd /etc/init.d && update-rc.d carbon defaults')
+
+    if web_server_pref == "nginx":
+        # starting nginx
+        sudo('nginx')
+        # starting uwsgi
+        sudo('supervisorctl update && supervisorctl start uwsgi')
+        configure_for_nginx()
+    else:
+        configure_for_apache()
+        sudo("apache2ctl restart")
+
+    # starting carbon-cache
+    sudo('/etc/init.d/carbon start')
+
+def install_deps(web_server):
+    sudo('apt-get update')
+    sudo('apt-get install -y %s' % get_dependency_packages(web_server))
+
     sudo('pip install whisper')
-    sudo('pip install django==1.3')
-    sudo('pip install django-tagging')
+    sudo('pip install carbon')
     sudo('pip install graphite-web')
 
-    # creating a folder for downloaded source files
-    sudo('mkdir -p /usr/local/src')
-     
+    sudo('pip install simplejson') # required for django admin
+    sudo('pip install django==1.3')
+    sudo('pip install django-tagging')
+
+def get_dependency_packages(web_server):
+    if web_server == "nginx":
+        return  ("apache2 apache2-mpm-worker apache2-utils "
+                "apache2.2-bin apache2.2-common build-essential git libapr1 "
+                "libaprutil1 libaprutil1-dbd-sqlite3 python3.2 "
+                "libpython3.2 python3.2-minimal libapache2-mod-wsgi "
+                "libaprutil1-ldap memcached python-cairo-dev "
+                "python-ldap python-memcache "
+                "python-pysqlite2 python-pip sqlite3 erlang-os-mon "
+                "erlang-snmp rabbitmq-server bzr")
+
+    else:
+        return  ("apache2 apache2-mpm-worker apache2-utils "
+                 "apache2.2-bin apache2.2-common build-essential "
+                 "git libapache2-mod-wsgi libapr1 "
+                 "libaprutil1 libaprutil1-dbd-sqlite3 python "
+                 "python-dev libapache2-mod-wsgi "
+                 "libaprutil1-ldap memcached python-cairo-dev "
+                 "python-ldap python-memcache "
+                 "python-pysqlite2 python-pip sqlite3 erlang-os-mon "
+                 "erlang-snmp rabbitmq-server "
+                 "bzr expect ssh")
+
+
+def configure_for_nginx():
     # Downloading PCRE source (Required for nginx)
     with cd('/usr/local/src'):
         sudo('wget ftp://ftp.csx.cam.ac.uk/pub/software/programming/pcre/pcre-8.32.tar.gz')
@@ -55,13 +128,11 @@ def graphite_install():
     sudo('mkdir -p /var/log/nginx')
     sudo('chown -R www-data: /var/log/nginx')
 
-    # creating automatic startup scripts for nginx and carbon
+    # creating automatic startup scripts for nginx
     put('config/nginx', '/etc/init.d/', use_sudo=True)
-    put('config/carbon', '/etc/init.d/', use_sudo=True)
     sudo('chmod ugo+x /etc/init.d/nginx')
-    sudo('chmod ugo+x /etc/init.d/carbon')
     sudo('cd /etc/init.d && update-rc.d nginx defaults')
-    sudo('cd /etc/init.d && update-rc.d carbon defaults')
+
 
     # installing uwsgi from source
     with cd('/usr/local/src'):
@@ -87,6 +158,32 @@ def graphite_install():
     put('config/nginx.conf', '/etc/nginx/', use_sudo=True)
     put('config/uwsgi.conf', '/etc/supervisor/conf.d/', use_sudo=True)
 
+
+def configure_for_apache():
+    # enable modules
+    sudo("a2enmod info")
+    sudo("a2enmod wsgi")
+
+    # enable site
+    with cd("/opt/graphite/conf"):
+        run("sudo cp carbon.conf.example carbon.conf")
+        run("sudo cp storage-schemas.conf.example storage-schemas.conf")
+
+    with settings(warn_only = True):
+        sudo("rm /etc/apache2/sites-enabled/000-default")
+
+    # fix path in vhost conf
+    sudo(("sed -i 's/run\/wsgi/\/var\/run\/apache2\/wsgi/g' "
+          "/opt/graphite/examples/example-graphite-vhost.conf"))
+
+    sudo(("ln -s -v "
+        "/opt/graphite/examples/example-graphite-vhost.conf "
+        "/etc/apache2/sites-enabled/graphite"))
+
+def install_cairo():
+    # creating a folder for downloaded source files
+    sudo('mkdir -p /usr/local/src')
+
     # installing pixman
     with cd('/usr/local/src'):
         sudo('wget http://cairographics.org/releases/pixman-0.28.2.tar.gz')
@@ -107,51 +204,8 @@ def graphite_install():
         sudo('./configure --prefix=/usr && make && make install')
         sudo('echo "/usr/local/lib" > /etc/ld.so.conf.d/pycairo.conf')
         sudo('ldconfig')
-    # installing giraffe dashboard
+
+def install_giraffe_dash():
     with cd('/opt/graphite/webapp'):
         sudo('git clone git://github.com/kenhub/giraffe.git')
-    # setting the carbon config files (default)
-    with cd('/opt/graphite/conf/'):
-        sudo('cp carbon.conf.example carbon.conf')
-        sudo('cp storage-schemas.conf.example storage-schemas.conf')
-    # clearing old carbon log files
-    put('config/carbon-logrotate', '/etc/cron.daily/', use_sudo=True)
 
-    # initializing graphite django db
-    with cd('/opt/graphite/webapp/graphite'):
-        sudo("python manage.py syncdb")
-
-    # changing ownership on graphite folders
-    sudo('chown -R www-data: /opt/graphite/')
-
-    # starting uwsgi
-    sudo('supervisorctl update && supervisorctl start uwsgi')
-
-    # starting carbon-cache
-    sudo('/etc/init.d/carbon start')
-
-    # starting nginx
-    sudo('nginx')
-
-
-def statsd_install():
-    """
-    Installs etsy's node.js statsd and dependencies
-    """
-    _check_sudo()
-    with cd('/usr/local/src'):
-        sudo('wget -N http://nodejs.org/dist/node-latest.tar.gz')
-        sudo('tar -zxvf node-latest.tar.gz')
-        sudo('cd `ls -rd node-v*` && make install')
-
-    with cd('/opt'):
-        sudo('git clone https://github.com/etsy/statsd.git')
-
-    with cd('/opt/statsd'):
-        sudo('git checkout v0.5.0') # or comment this out and stay on trunk
-        put('config/localConfig.js', 'localConfig.js', use_sudo=True)
-        sudo('npm install')
-
-    put('config/statsd.conf', '/etc/supervisor/conf.d/', use_sudo=True)
-
-    sudo('supervisorctl update && supervisorctl start statsd')
